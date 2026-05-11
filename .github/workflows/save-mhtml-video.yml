@@ -1,0 +1,271 @@
+name: MHTML ذخیره صفحه به همراه فیلم
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL of the webpage to download'
+        required: true
+        type: string
+      title:
+        description: 'عنوان اصلی فایل خروجی'
+        required: true
+        type: string
+      password:
+        description: 'رمز عبور برای فایل ZIP'
+        required: true
+        type: string
+      start_from:
+        description: 'شروع لینک‌ها از شماره'
+        required: false
+        type: string
+        default: '0'
+      end_at:
+        description: 'پایان لینک‌ها تا شماره (0 = نامحدود)'
+        required: false
+        type: string
+        default: '0'
+      download_videos:
+        description: 'دانلود فیلم‌های داخل صفحه؟'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install pyppeteer beautifulsoup4 yt-dlp
+
+      - name: Create Python script with video download
+        run: |
+          cat > save_with_videos.py << 'EOF'
+          import asyncio
+          import os
+          import re
+          import subprocess
+          from pyppeteer import launch
+          from bs4 import BeautifulSoup
+          import argparse
+          from urllib.parse import urljoin, urlparse
+          
+          async def save_mhtml(page, url, output_path):
+              await page.goto(url, waitUntil='networkidle2')
+              cdp = await page.target.createCDPSession()
+              result = await cdp.send('Page.captureSnapshot', {})
+              with open(output_path, 'w', encoding='utf-8') as f:
+                  f.write(result['data'])
+              return True
+          
+          async def extract_video_links(page, url):
+              """استخراج لینک‌های فیلم از صفحه"""
+              video_links = []
+              
+              # روش 1: پیدا کردن تگ‌های video و source
+              content = await page.content()
+              soup = BeautifulSoup(content, 'html.parser')
+              
+              # تگ‌های video
+              for video in soup.find_all('video'):
+                  for source in video.find_all('source'):
+                      src = source.get('src')
+                      if src:
+                          full_url = urljoin(url, src)
+                          video_links.append(full_url)
+                  
+                  # src مستقیم در video
+                  direct_src = video.get('src')
+                  if direct_src:
+                      full_url = urljoin(url, direct_src)
+                      video_links.append(full_url)
+              
+              # تگ‌های iframe (یوتیوب، ویمیو و...)
+              for iframe in soup.find_all('iframe'):
+                  src = iframe.get('src')
+                  if src and ('youtube.com/embed' in src or 'player.vimeo.com' in src):
+                      video_links.append(src)
+              
+              # روش 2: استفاده از جاوااسکریپت برای پیدا کردن ویدیوها
+              js_videos = await page.evaluate('''() => {
+                  const videos = [];
+                  // پیدا کردن همه المنت‌های ویدیو
+                  document.querySelectorAll('video, audio, [data-video-url], [data-src*="mp4"]').forEach(el => {
+                      if (el.src) videos.push(el.src);
+                      if (el.dataset && el.dataset.videoUrl) videos.push(el.dataset.videoUrl);
+                      if (el.dataset && el.dataset.src) videos.push(el.dataset.src);
+                  });
+                  return videos;
+              }''')
+              
+              for v in js_videos:
+                  if v and v not in video_links:
+                      video_links.append(v)
+              
+              return list(set(video_links))
+          
+          async def download_video(url, output_path):
+              """دانلود فیلم با yt-dlp"""
+              try:
+                  cmd = ['yt-dlp', '-f', 'best[ext=mp4]/best', '-o', output_path, '--no-warnings', url]
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                  return result.returncode == 0
+              except Exception as e:
+                  print(f"Download error: {e}")
+                  return False
+          
+          async def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument('--url', required=True)
+              parser.add_argument('--title', required=True)
+              parser.add_argument('--start-from', default='0')
+              parser.add_argument('--end-at', default='0')
+              parser.add_argument('--download-videos', action='store_true')
+              args = parser.parse_args()
+              
+              start_idx = int(args.start_from)
+              end_idx = int(args.end_at) if args.end_at != '0' else 999999
+              
+              os.makedirs('downloader', exist_ok=True)
+              
+              browser = await launch(headless=True, args=['--no-sandbox'])
+              page = await browser.newPage()
+              
+              await page.goto(args.url, waitUntil='networkidle2')
+              
+              # استخراج لینک‌های داخلی
+              content = await page.content()
+              soup = BeautifulSoup(content, 'html.parser')
+              
+              base_domain = urlparse(args.url).netloc
+              links = []
+              
+              for a in soup.find_all('a', href=True):
+                  href = a['href']
+                  full_url = urljoin(args.url, href)
+                  parsed = urlparse(full_url)
+                  if parsed.netloc == base_domain and parsed.scheme in ['http', 'https']:
+                      if full_url not in links and full_url != args.url:
+                          links.append(full_url)
+              
+              total_links = len(links)
+              print(f"🔗 Total internal links found: {total_links}")
+              
+              # اعمال محدوده
+              end_idx = min(end_idx, total_links)
+              selected_links = links[start_idx:end_idx]
+              
+              # استخراج فیلم از صفحه اصلی
+              video_files = []
+              if args.download_videos:
+                  print("🎬 Looking for videos on main page...")
+                  video_links = await extract_video_links(page, args.url)
+                  for i, vlink in enumerate(video_links):
+                      vname = f"downloader/{args.title}_video_{i+1}.mp4"
+                      print(f"Downloading video {i+1}: {vlink[:80]}...")
+                      if await download_video(vlink, vname):
+                          video_files.append(vname)
+                          print(f"✅ Video {i+1} downloaded")
+                      else:
+                          print(f"❌ Failed to download video {i+1}")
+              
+              # ذخیره صفحات
+              range_str = f"{start_idx}-{end_idx-1}"
+              main_file = f"downloader/{args.title}_{range_str}_main.mhtml"
+              await save_mhtml(page, args.url, main_file)
+              print(f"✅ Main page saved")
+              
+              saved = 1
+              for i, link in enumerate(selected_links, start=start_idx+1):
+                  link_file = f"downloader/{args.title}_link_{i}.mhtml"
+                  try:
+                      new_page = await browser.newPage()
+                      await save_mhtml(new_page, link, link_file)
+                      
+                      # فیلم‌های صفحات لینک شده هم دانلود شود
+                      if args.download_videos:
+                          vlinks = await extract_video_links(new_page, link)
+                          for j, vlink in enumerate(vlinks):
+                              vname = f"downloader/{args.title}_link_{i}_video_{j+1}.mp4"
+                              await download_video(vlink, vname)
+                      
+                      saved += 1
+                      print(f"✅ [{i}/{total_links}] Saved: {link[:80]}...")
+                      await new_page.close()
+                  except Exception as e:
+                      print(f"❌ Failed: {link[:80]}... - {e}")
+              
+              await browser.close()
+              
+              print(f"\n🎉 Done! {saved} pages saved")
+              if video_files:
+                  print(f"🎬 {len(video_files)} videos downloaded")
+          
+          if __name__ == '__main__':
+              asyncio.run(main())
+          EOF
+
+      - name: Run downloader
+        run: |
+          VIDEO_FLAG=""
+          if [ "${{ github.event.inputs.download_videos }}" == "true" ]; then
+            VIDEO_FLAG="--download-videos"
+          fi
+          
+          python save_with_videos.py \
+            --url "${{ github.event.inputs.url }}" \
+            --title "${{ github.event.inputs.title }}" \
+            --start-from "${{ github.event.inputs.start_from }}" \
+            --end-at "${{ github.event.inputs.end_at }}" \
+            ${VIDEO_FLAG}
+
+      - name: Create password-protected ZIP
+        id: zip
+        run: |
+          sudo apt-get install -y zip
+          
+          START="${{ github.event.inputs.start_from }}"
+          END="${{ github.event.inputs.end_at }}"
+          
+          if [ "$END" == "0" ]; then
+            RANGE="${START}+"
+          else
+            END_IDX=$((END - 1))
+            RANGE="${START}-${END_IDX}"
+          fi
+          
+          FILENAME="${{ github.event.inputs.title }}_${RANGE}.zip"
+          
+          zip -j -P "${{ github.event.inputs.password }}" "$FILENAME" downloader/*.{mhtml,mp4,webm} 2>/dev/null || \
+          zip -j -P "${{ github.event.inputs.password }}" "$FILENAME" downloader/*.mhtml
+          
+          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
+          echo "✅ Created: $FILENAME"
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          FILENAME="${{ steps.zip.outputs.filename }}"
+          git add "$FILENAME"
+          git commit -m "📦 $FILENAME [skip ci]" || echo "Nothing to commit"
+          git push
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf downloader
+          rm -f save_with_videos.py
