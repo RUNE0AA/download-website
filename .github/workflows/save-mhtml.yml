@@ -115,21 +115,14 @@ jobs:
             ${EXTRACT} \
             ${GITHUB_ACTOR:+--title "${{ github.event.inputs.title }}"}
 
-      - name: Upload to GitHub Releases (Private Draft)
-        uses: softprops/action-gh-release@v2
+      - name: 📤 Upload as Artifact (بدون نیاز به Release)
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: mhtml-${{ github.run_number }}
-          name: "MHTML - ${{ github.event.inputs.url }}"
-          body: |
-            **📄 MHTML Archive**
-            **URL:** ${{ github.event.inputs.url }}
-            **Links extracted:** ${{ github.event.inputs.extract_links }}
-            **Date:** $(date '+%Y-%m-%d %H:%M:%S')
-          files: download/*
-          token: ${{ secrets.GITHUB_TOKEN }}
-          draft: true
+          name: mhtml-${{ github.run_id }}
+          path: download/
+          retention-days: 90
 
-      - name: Cleanup
+      - name: 🧹 Cleanup
         if: always()
         run: |
           rm -rf download
